@@ -26,16 +26,18 @@ struct WorkItem {
     String source;
     String destination;
     off_t size;
+    size_t top_directory_index;
 };
 
 static int perform_copy(Vector<String> const& sources, String const& destination);
 static int perform_move(Vector<String> const& sources, String const& destination);
 static int perform_delete(Vector<String> const& sources);
-static int execute_work_items(Vector<WorkItem> const& items);
+static int execute_work_items(Vector<WorkItem>& items);
 static void report_error(String message);
 static void report_warning(String message);
 static AK::Result<AK::NonnullRefPtr<Core::File>, AK::OSError> open_destination_file(String const& destination);
 static String deduplicate_destination_file_name(String const& destination);
+static void rename_top_directory_in_work_items(String const& old_destination, String const& new_destination, size_t top_directory_index, Vector<WorkItem>& items);
 
 int main(int argc, char** argv)
 {
@@ -75,7 +77,7 @@ static void report_warning(String message)
     outln("WARN {}", message);
 }
 
-static bool collect_copy_work_items(String const& source, String const& destination, Vector<WorkItem>& items)
+static bool collect_copy_work_items(String const& source, String const& destination, size_t top_directory_index, Vector<WorkItem>& items)
 {
     struct stat st = {};
     if (lstat(source.characters(), &st) < 0) {
@@ -91,6 +93,7 @@ static bool collect_copy_work_items(String const& source, String const& destinat
             .source = source,
             .destination = LexicalPath::join(destination, LexicalPath::basename(source)).string(),
             .size = st.st_size,
+            .top_directory_index = top_directory_index,
         });
         return true;
     }
@@ -101,6 +104,7 @@ static bool collect_copy_work_items(String const& source, String const& destinat
         .source = {},
         .destination = LexicalPath::join(destination, LexicalPath::basename(source)).string(),
         .size = 0,
+        .top_directory_index = top_directory_index,
     });
 
     Core::DirIterator dt(source, Core::DirIterator::SkipParentAndBaseDir);
@@ -109,6 +113,7 @@ static bool collect_copy_work_items(String const& source, String const& destinat
         if (!collect_copy_work_items(
                 LexicalPath::join(source, name).string(),
                 LexicalPath::join(destination, LexicalPath::basename(source)).string(),
+                top_directory_index,
                 items)) {
             return false;
         }
@@ -121,15 +126,15 @@ int perform_copy(Vector<String> const& sources, String const& destination)
 {
     Vector<WorkItem> items;
 
-    for (auto& source : sources) {
-        if (!collect_copy_work_items(source, destination, items))
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (!collect_copy_work_items(sources[i], destination, i, items))
             return 1;
     }
 
     return execute_work_items(items);
 }
 
-static bool collect_move_work_items(String const& source, String const& destination, Vector<WorkItem>& items)
+static bool collect_move_work_items(String const& source, String const& destination, size_t top_directory_index, Vector<WorkItem>& items)
 {
     struct stat st = {};
     if (lstat(source.characters(), &st) < 0) {
@@ -145,6 +150,7 @@ static bool collect_move_work_items(String const& source, String const& destinat
             .source = source,
             .destination = LexicalPath::join(destination, LexicalPath::basename(source)).string(),
             .size = st.st_size,
+            .top_directory_index = top_directory_index,
         });
         return true;
     }
@@ -155,6 +161,7 @@ static bool collect_move_work_items(String const& source, String const& destinat
         .source = {},
         .destination = LexicalPath::join(destination, LexicalPath::basename(source)).string(),
         .size = 0,
+        .top_directory_index = top_directory_index,
     });
 
     Core::DirIterator dt(source, Core::DirIterator::SkipParentAndBaseDir);
@@ -163,6 +170,7 @@ static bool collect_move_work_items(String const& source, String const& destinat
         if (!collect_move_work_items(
                 LexicalPath::join(source, name).string(),
                 LexicalPath::join(destination, LexicalPath::basename(source)).string(),
+                top_directory_index,
                 items)) {
             return false;
         }
@@ -173,6 +181,7 @@ static bool collect_move_work_items(String const& source, String const& destinat
         .source = source,
         .destination = {},
         .size = 0,
+        .top_directory_index = top_directory_index,
     });
 
     return true;
@@ -182,8 +191,8 @@ int perform_move(Vector<String> const& sources, String const& destination)
 {
     Vector<WorkItem> items;
 
-    for (auto& source : sources) {
-        if (!collect_move_work_items(source, destination, items))
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (!collect_move_work_items(sources[i], destination, i, items))
             return 1;
     }
 
@@ -206,6 +215,7 @@ static bool collect_delete_work_items(String const& source, Vector<WorkItem>& it
             .source = source,
             .destination = {},
             .size = st.st_size,
+            .top_directory_index = 0,
         });
         return true;
     }
@@ -223,6 +233,7 @@ static bool collect_delete_work_items(String const& source, Vector<WorkItem>& it
         .source = source,
         .destination = {},
         .size = 0,
+        .top_directory_index = 0,
     });
 
     return true;
@@ -240,7 +251,7 @@ int perform_delete(Vector<String> const& sources)
     return execute_work_items(items);
 }
 
-int execute_work_items(Vector<WorkItem> const& items)
+int execute_work_items(Vector<WorkItem>& items)
 {
     off_t total_work_bytes = 0;
     for (auto& item : items)
@@ -295,12 +306,23 @@ int execute_work_items(Vector<WorkItem> const& items)
 
         case WorkItem::Type::CreateDirectory: {
             outln("MKDIR {}", item.destination);
-            // FIXME: Support deduplication like open_destination_file() when the directory already exists.
-            if (mkdir(item.destination.characters(), 0755) < 0 && errno != EEXIST) {
+            String old_destination = item.destination;
+            String new_destination = old_destination;
+            while (true) {
+                if (mkdir(new_destination.characters(), 0755) == 0)
+                    break;
+
                 auto original_errno = errno;
+                // FIXME: When the directory already exists, let the user choose the next action instead of renaming it by default.
+                if (original_errno == EEXIST) {
+                    new_destination = deduplicate_destination_file_name(new_destination);
+                    continue;
+                }
+
                 report_error(String::formatted("mkdir: {}", strerror(original_errno)));
                 return 1;
             }
+            rename_top_directory_in_work_items(old_destination, new_destination, item.top_directory_index, items);
             break;
         }
 
@@ -403,4 +425,14 @@ String deduplicate_destination_file_name(String const& destination)
     }
 
     return LexicalPath::join(destination_path.dirname(), basename.to_string()).string();
+}
+
+void rename_top_directory_in_work_items(String const& old_destination, String const& new_destination, size_t top_directory_index, Vector<WorkItem>& items)
+{
+    for (auto& item : items) {
+        if (item.top_directory_index == top_directory_index && !item.destination.is_empty()) {
+            auto relative_path = LexicalPath::relative_path(item.destination, old_destination);
+            item.destination = LexicalPath::join(new_destination, relative_path).string();
+        }
+    }
 }
